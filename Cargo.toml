@@ -137,4 +137,3 @@ insta.opt-level = 3
 # These make the build much slower but shrink the binary, and could help performance
 codegen-units = 1
 lto = "thin"
-
