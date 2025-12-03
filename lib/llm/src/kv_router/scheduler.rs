@@ -487,8 +487,9 @@ impl ManualScheduler {
             let dp_size = config.as_ref().map(|c| c.data_parallel_size).unwrap_or(1);
             for dp_rank in 0..dp_size {
                 let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
+                let overlap = overlaps.scores.get(&worker).copied().unwrap_or(0);
                 decode_blocks.insert(worker, request_blocks);
-                prefill_tokens.insert(worker, isl_tokens);
+                prefill_tokens.insert(worker, isl_tokens - (overlap * self.block_size) as usize);
             }
         }
 
