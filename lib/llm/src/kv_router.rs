@@ -21,6 +21,8 @@ use dynamo_runtime::{
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 pub mod approx;
 pub mod indexer;
@@ -45,7 +47,9 @@ use crate::{
         protocols::{
             LocalBlockHash, RouterRequest, RouterResponse, WorkerSelectionResult, WorkerWithDpRank,
         },
-        scheduler::{KvScheduler, KvSchedulerError, PotentialLoad, SchedulingRequest},
+        scheduler::{
+            KvScheduler, KvSchedulerError, ManualScheduler, PotentialLoad, SchedulingRequest,
+        },
         sequence::SequenceError,
         subscriber::start_kv_router_background,
     },
@@ -259,7 +263,7 @@ pub struct KvRouter {
     indexer: Indexer,
 
     // How about a Box<dyn KvIndexerInterface>
-    scheduler: KvScheduler,
+    scheduler: SchedulerHandle,
 
     block_size: u32,
 
@@ -267,7 +271,99 @@ pub struct KvRouter {
 
     cancellation_token: tokio_util::sync::CancellationToken,
 
-    client: Client,
+    client: Option<Client>,
+}
+
+enum SchedulerHandle {
+    Runtime(KvScheduler),
+    Manual(ManualScheduler),
+}
+
+impl SchedulerHandle {
+    async fn schedule(
+        &self,
+        maybe_request_id: Option<String>,
+        isl_tokens: usize,
+        token_seq: Option<Vec<SequenceHash>>,
+        overlaps: OverlapScores,
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+    ) -> Result<WorkerWithDpRank, KvSchedulerError> {
+        match self {
+            SchedulerHandle::Runtime(s) => {
+                s.schedule(
+                    maybe_request_id,
+                    isl_tokens,
+                    token_seq,
+                    overlaps,
+                    router_config_override,
+                    update_states,
+                )
+                .await
+            }
+            SchedulerHandle::Manual(s) => {
+                s.schedule(
+                    maybe_request_id,
+                    isl_tokens,
+                    token_seq,
+                    overlaps,
+                    router_config_override,
+                    update_states,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn add_request(
+        &self,
+        request_id: String,
+        token_sequence: Option<Vec<SequenceHash>>,
+        isl: usize,
+        overlap: u32,
+        worker: WorkerWithDpRank,
+    ) -> Result<(), SequenceError> {
+        match self {
+            SchedulerHandle::Runtime(s) => {
+                s.add_request(request_id, token_sequence, isl, overlap, worker)
+                    .await
+            }
+            SchedulerHandle::Manual(s) => {
+                s.add_request(request_id, token_sequence, isl, overlap, worker)
+                    .await
+            }
+        }
+    }
+
+    async fn mark_prefill_completed(&self, request_id: &str) -> Result<(), SequenceError> {
+        match self {
+            SchedulerHandle::Runtime(s) => s.mark_prefill_completed(request_id).await,
+            SchedulerHandle::Manual(s) => s.mark_prefill_completed(request_id).await,
+        }
+    }
+
+    async fn free(&self, request_id: &str) -> Result<(), SequenceError> {
+        match self {
+            SchedulerHandle::Runtime(s) => s.free(request_id).await,
+            SchedulerHandle::Manual(s) => s.free(request_id).await,
+        }
+    }
+
+    async fn get_potential_loads(
+        &self,
+        token_seq: Option<Vec<SequenceHash>>,
+        isl_tokens: usize,
+        overlaps: OverlapScores,
+    ) -> Result<Vec<PotentialLoad>> {
+        match self {
+            SchedulerHandle::Runtime(s) => Ok(s
+                .get_potential_loads(token_seq, isl_tokens, overlaps)
+                .await),
+            SchedulerHandle::Manual(s) => {
+                s.get_potential_loads(token_seq, isl_tokens, overlaps).await
+            }
+        }
+    }
 }
 
 impl KvRouter {
@@ -363,17 +459,82 @@ impl KvRouter {
         tracing::info!("KV Routing initialized");
         Ok(Self {
             indexer,
-            scheduler,
+            scheduler: SchedulerHandle::Runtime(scheduler),
             block_size,
             kv_router_config,
             cancellation_token,
-            client,
+            client: Some(client),
         })
     }
 
-    /// Get a reference to the client used by this KvRouter
+    /// Construct a KvRouter without the distributed runtime. The caller supplies
+    /// watch channels for worker IDs and runtime configs, along with a
+    /// cancellation token to stop background tasks.
+    pub async fn new_manual(
+        block_size: u32,
+        selector: Option<Box<dyn WorkerSelector + Send + Sync>>,
+        kv_router_config: Option<KvRouterConfig>,
+        instance_ids_rx: watch::Receiver<Vec<u64>>,
+        runtime_configs_rx: watch::Receiver<HashMap<protocols::WorkerId, ModelRuntimeConfig>>,
+        cancellation_token: Option<CancellationToken>,
+    ) -> Result<Self> {
+        let kv_router_config = kv_router_config.unwrap_or_default();
+        let cancellation_token = cancellation_token.unwrap_or_else(CancellationToken::new);
+
+        let indexer = if kv_router_config.overlap_score_weight == 0.0 {
+            Indexer::None
+        } else {
+            let kv_indexer_metrics = Arc::new(indexer::KvIndexerMetrics::new_unregistered());
+
+            let prune_config = if !kv_router_config.use_kv_events {
+                Some(PruneConfig {
+                    ttl: Duration::from_secs_f64(kv_router_config.router_ttl_secs),
+                    max_tree_size: kv_router_config.router_max_tree_size,
+                    prune_target_ratio: kv_router_config.router_prune_target_ratio,
+                })
+            } else {
+                None
+            };
+
+            Indexer::KvIndexer(KvIndexer::new_with_frequency(
+                cancellation_token.clone(),
+                None, // expiration_duration for frequency tracking
+                block_size,
+                kv_indexer_metrics,
+                prune_config,
+            ))
+        };
+
+        let scheduler = ManualScheduler::start(
+            block_size,
+            instance_ids_rx,
+            runtime_configs_rx,
+            selector,
+            kv_router_config.router_replica_sync,
+            cancellation_token.clone(),
+        )
+        .await?;
+
+        Ok(Self {
+            indexer,
+            scheduler: SchedulerHandle::Manual(scheduler),
+            block_size,
+            kv_router_config,
+            cancellation_token,
+            client: None,
+        })
+    }
+
+    /// Get a reference to the client used by this KvRouter (runtime mode only).
     pub fn client(&self) -> &Client {
-        &self.client
+        self.client
+            .as_ref()
+            .expect("KvRouter client is only available in runtime mode")
+    }
+
+    /// Get an optional reference to the client (manual mode returns None).
+    pub fn client_opt(&self) -> Option<&Client> {
+        self.client.as_ref()
     }
 
     /// Give these tokens, find the worker with the best match in it's KV cache.
@@ -490,15 +651,26 @@ impl KvRouter {
             compute_seq_hash_for_block(&block_hashes)
         });
 
-        Ok(self
-            .scheduler
+        self.scheduler
             .get_potential_loads(maybe_seq_hashes, isl_tokens, overlap_scores)
-            .await)
+            .await
     }
 
     /// Dump all events from the indexer
     pub async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
         self.indexer.dump_events().await
+    }
+
+    /// Manually apply a RouterEvent to the indexer (for manual integrations).
+    pub async fn process_event(&self, event: RouterEvent) -> Result<(), KvRouterError> {
+        match self.indexer {
+            Indexer::KvIndexer(ref idx) => idx
+                .event_sender()
+                .send(event)
+                .await
+                .map_err(|_| KvRouterError::IndexerOffline),
+            Indexer::None => Ok(()),
+        }
     }
 }
 

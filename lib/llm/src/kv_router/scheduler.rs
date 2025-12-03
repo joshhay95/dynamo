@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, watch};
+use tokio_util::sync::CancellationToken;
 
 use super::KV_HIT_RATE_SUBJECT;
 use super::KvRouterConfig;
@@ -377,6 +378,181 @@ impl KvScheduler {
         }
 
         loads
+    }
+}
+
+/// A lightweight scheduler that doesn't require the distributed runtime.
+pub struct ManualScheduler {
+    block_size: u32,
+    selector: Box<dyn WorkerSelector + Send + Sync>,
+    workers_with_configs: Arc<RwLock<HashMap<WorkerId, Option<ModelRuntimeConfig>>>>,
+    _watch_task: tokio::task::JoinHandle<()>,
+    cancellation_token: CancellationToken,
+}
+
+impl ManualScheduler {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start(
+        block_size: u32,
+        instance_ids_rx: watch::Receiver<Vec<u64>>,
+        runtime_configs_rx: watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>,
+        selector: Option<Box<dyn WorkerSelector + Send + Sync>>,
+        replica_sync: bool,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self, KvSchedulerError> {
+        let _ = replica_sync; // replica sync is unsupported in manual mode
+        let selector = selector.unwrap_or(Box::new(DefaultWorkerSelector::default()));
+        let instance_ids: Vec<u64> = instance_ids_rx.borrow().clone();
+        let runtime_configs: HashMap<WorkerId, ModelRuntimeConfig> =
+            runtime_configs_rx.borrow().clone();
+
+        let workers_with_configs: Arc<RwLock<HashMap<WorkerId, Option<ModelRuntimeConfig>>>> = {
+            let mut initial_map = HashMap::new();
+            for worker_id in &instance_ids {
+                let config = runtime_configs.get(worker_id).cloned();
+                initial_map.insert(*worker_id, config);
+            }
+            Arc::new(RwLock::new(initial_map))
+        };
+
+        // Watch for updates to instances/configs
+        let mut instance_ids_monitor_rx = instance_ids_rx.clone();
+        let mut configs_monitor_rx = runtime_configs_rx.clone();
+        let workers_monitor = workers_with_configs.clone();
+        let cancel = cancellation_token.clone();
+        let _watch_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    changed = instance_ids_monitor_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    changed = configs_monitor_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+
+                let new_instance_ids = instance_ids_monitor_rx.borrow_and_update().clone();
+                let new_configs = configs_monitor_rx.borrow_and_update().clone();
+                let mut new_workers_with_configs = HashMap::new();
+                for worker_id in &new_instance_ids {
+                    let config = new_configs.get(worker_id).cloned();
+                    new_workers_with_configs.insert(*worker_id, config);
+                }
+
+                let mut workers_map = workers_monitor.write().await;
+                *workers_map = new_workers_with_configs;
+            }
+        });
+
+        Ok(Self {
+            block_size,
+            selector,
+            workers_with_configs,
+            _watch_task,
+            cancellation_token,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation_token.cancel();
+    }
+
+    pub async fn schedule(
+        &self,
+        maybe_request_id: Option<String>,
+        isl_tokens: usize,
+        token_seq: Option<Vec<SequenceHash>>,
+        overlaps: OverlapScores,
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+    ) -> Result<WorkerWithDpRank, KvSchedulerError> {
+        let _ = maybe_request_id;
+        let _ = update_states;
+
+        let workers = self.workers_with_configs.read().await.clone();
+        if workers.is_empty() {
+            return Err(KvSchedulerError::NoEndpoints);
+        }
+
+        // Approximate current loads: we don't track active sequences here
+        let request_blocks = isl_tokens.div_ceil(self.block_size as usize);
+        let mut decode_blocks = HashMap::new();
+        let mut prefill_tokens = HashMap::new();
+        for (worker_id, config) in workers.iter() {
+            let dp_size = config.as_ref().map(|c| c.data_parallel_size).unwrap_or(1);
+            for dp_rank in 0..dp_size {
+                let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
+                decode_blocks.insert(worker, request_blocks);
+                prefill_tokens.insert(worker, isl_tokens);
+            }
+        }
+
+        let request = SchedulingRequest {
+            maybe_request_id: None,
+            token_seq,
+            isl_tokens,
+            overlaps,
+            decode_blocks,
+            prefill_tokens,
+            router_config_override: router_config_override.cloned(),
+            update_states,
+            resp_tx: None,
+        };
+
+        let selection = self
+            .selector
+            .select_worker(&workers, &request, self.block_size)?;
+
+        let _ = request.token_seq;
+
+        Ok(selection.worker)
+    }
+
+    pub async fn add_request(
+        &self,
+        _request_id: String,
+        _token_sequence: Option<Vec<SequenceHash>>,
+        _isl: usize,
+        _overlap: u32,
+        _worker: WorkerWithDpRank,
+    ) -> Result<(), SequenceError> {
+        Ok(())
+    }
+
+    pub async fn mark_prefill_completed(&self, _request_id: &str) -> Result<(), SequenceError> {
+        Ok(())
+    }
+
+    pub async fn free(&self, _request_id: &str) -> Result<(), SequenceError> {
+        Ok(())
+    }
+
+    pub async fn get_potential_loads(
+        &self,
+        _token_seq: Option<Vec<SequenceHash>>,
+        isl_tokens: usize,
+        _overlaps: OverlapScores,
+    ) -> Result<Vec<PotentialLoad>> {
+        let workers = self.workers_with_configs.read().await.clone();
+        let mut loads = Vec::new();
+        let request_blocks = isl_tokens.div_ceil(self.block_size as usize);
+        for (worker_id, config) in workers {
+            let dp_size = config.as_ref().map(|c| c.data_parallel_size).unwrap_or(1);
+            for dp_rank in 0..dp_size {
+                loads.push(PotentialLoad {
+                    worker_id,
+                    dp_rank,
+                    potential_prefill_tokens: isl_tokens,
+                    potential_decode_blocks: request_blocks,
+                });
+            }
+        }
+        Ok(loads)
     }
 }
 
